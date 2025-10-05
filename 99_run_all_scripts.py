@@ -17,7 +17,7 @@ load_dotenv()
 PIPELINE_SCRIPTS = [
     "01_steam_to_supabase_pipeline.py",
     "02_update_recent_reviews.py", 
-    "03_collect_all_nintendo_games_clean.py",
+    # "03_collect_all_nintendo_games_clean.py",  # Temporarily bypassed
     "04_check_coming_soon_updates.py",
     "05_update_release_date_actual.py",
     "06_recreate_top_line_metrics.py"
