@@ -101,6 +101,16 @@ class SupabasePipeline:
                 FROM games 
                 WHERE type = 'game' 
                 AND lower(name) NOT LIKE '%playtest%'
+                AND NOT (
+                    content_descriptors ILIKE '%sexual assault%'
+                    OR content_descriptors ILIKE '%non-consensual%'
+                    OR content_descriptors ILIKE '%BDSM%'
+                    OR content_descriptors ILIKE '%extreme violence%'
+                    OR content_descriptors ILIKE '%rape%'
+                    OR content_descriptors ILIKE '%sexual%'
+                    OR content_descriptors ILIKE '%NSFW%'
+                    OR content_descriptors ILIKE '%explicit%'
+                )
                 GROUP BY 1
                 ORDER BY 2 DESC
             """)
@@ -209,6 +219,16 @@ class SupabasePipeline:
                 WHERE g.type = 'game'
                   AND (g.release_date::jsonb->>'coming_soon')::boolean = false
                   AND g.review_score_desc IN ('Very Positive', 'Overwhelmingly Positive')
+                  AND NOT (
+                      g.content_descriptors ILIKE '%sexual assault%'
+                      OR g.content_descriptors ILIKE '%non-consensual%'
+                      OR g.content_descriptors ILIKE '%BDSM%'
+                      OR g.content_descriptors ILIKE '%extreme violence%'
+                      OR g.content_descriptors ILIKE '%rape%'
+                      OR g.content_descriptors ILIKE '%sexual%'
+                      OR g.content_descriptors ILIKE '%NSFW%'
+                      OR g.content_descriptors ILIKE '%explicit%'
+                  )
                 ORDER BY COALESCE(g.total_positive, 0) DESC
             """)
 
@@ -264,8 +284,18 @@ class SupabasePipeline:
                       'Positive', 'Mostly Positive', 'Very Positive', 'Overwhelmingly Positive'
                   )
                   AND g.release_date_actual IS NOT NULL
-                  AND g.release_date_actual >= (CURRENT_DATE - INTERVAL '15 days')
+                  AND g.release_date_actual >= (CURRENT_DATE - INTERVAL '60 days')
                   AND COALESCE(g.num_reviews, 0) BETWEEN 11 AND 5000
+                  AND NOT (
+                      g.content_descriptors ILIKE '%sexual assault%'
+                      OR g.content_descriptors ILIKE '%non-consensual%'
+                      OR g.content_descriptors ILIKE '%BDSM%'
+                      OR g.content_descriptors ILIKE '%extreme violence%'
+                      OR g.content_descriptors ILIKE '%rape%'
+                      OR g.content_descriptors ILIKE '%sexual%'
+                      OR g.content_descriptors ILIKE '%NSFW%'
+                      OR g.content_descriptors ILIKE '%explicit%'
+                  )
                 ORDER BY COALESCE(g.total_reviews, 0) DESC
                 LIMIT 100
             """)

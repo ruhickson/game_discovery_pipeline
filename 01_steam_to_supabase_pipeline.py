@@ -9,6 +9,8 @@ import os
 import sys
 from dotenv import load_dotenv
 
+from steam_store_notices import empty_store_notices, parse_store_notices
+
 load_dotenv()
 
 # Ensure stdout/stderr handle UTF-8 so emojis and non-ASCII don't crash on Windows consoles
@@ -32,13 +34,39 @@ class SteamAPI:
         }
         
     def get_app_list(self):
-        """Get list of all Steam apps."""
+        """Get list of all Steam apps using ISteamApps/GetAppList/v2/.
+        
+        Returns:
+            List of apps with format: [{'appid': int, 'name': str}, ...]
+        """
         url = f"{self.base_url}/ISteamApps/GetAppList/v2/"
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('applist', {}).get('apps', [])
+        try:
+            print("📋 Fetching Steam app list...")
+            response = requests.get(url, headers=self.headers, timeout=120)
+            if response.status_code == 200:
+                data = response.json()
+                apps = data.get('applist', {}).get('apps', [])
+                print(f"✅ Fetched {len(apps)} total apps from Steam")
+                return apps
+            else:
+                print(f"⚠️  GetAppList API returned status {response.status_code}")
+                print(f"   Response: {response.text[:200]}")
+        except Exception as e:
+            print(f"⚠️  Error fetching app list: {str(e)}")
         return None
+    
+    def check_app_exists(self, app_id):
+        """Check if an app_id exists on Steam by trying to get its details."""
+        try:
+            url = f"https://store.steampowered.com/api/appdetails?appids={app_id}"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if str(app_id) in data and data[str(app_id)]['success']:
+                    return True
+            return False
+        except:
+            return False
     
     def get_app_details(self, app_id, retry_count=0):
         """Get detailed information about a specific app."""
@@ -91,13 +119,13 @@ class SteamAPI:
             print(f"Error getting review summary for app_id {app_id}: {str(e)}")
             return {}
     
-    def get_game_tags(self, app_id, retry_count=0):
-        """Get user tags for a specific game from Steam store page."""
+    def get_store_page_html(self, app_id, retry_count=0, max_retries=4):
+        """Fetch Steam store HTML for an app (used for tags + disclosure notices)."""
         try:
-            # Add delay between requests (0.3-0.6 second)
-            time.sleep(random.uniform(0.3, 0.6))
+            # Back off harder after gateway failures / rate limits
+            base_delay = 0.8 if retry_count else 0.4
+            time.sleep(random.uniform(base_delay, base_delay + 0.5) + retry_count * 1.5)
             url = f'https://store.steampowered.com/app/{app_id}/'
-            
             headers = {
                 'User-Agent': self.headers['User-Agent'],
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -105,33 +133,89 @@ class SteamAPI:
                 'Accept-Encoding': 'gzip, deflate',
                 'Connection': 'keep-alive',
             }
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 429:
-                print(f"Rate limited (429) for app_id {app_id}. Waiting 2 minutes before retrying...")
-                time.sleep(120)
-                return self.get_game_tags(app_id, retry_count)
-            
-            if response.status_code == 200:
-                # Look for tags in the HTML - focus on the most common pattern
-                tag_pattern = r'"tagid":\s*(\d+),\s*"name":\s*"([^"]+)"'
-                matches = re.findall(tag_pattern, response.text)
-                if matches:
-                    tags = [match[1] for match in matches]
-                    print(f"🏷️  Found {len(tags)} tags for app_id {app_id}")
-                    return tags
-            
-            print(f"📭 No tags found for app_id {app_id}")
-            return []
-            
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, 
+            response = requests.get(url, headers=headers, timeout=20)
+            # Steam often returns 502/503 under load — retry with backoff
+            if response.status_code in (429, 502, 503, 504):
+                if retry_count >= max_retries:
+                    print(
+                        f"Failed to fetch store page for app_id {app_id}: "
+                        f"{response.status_code} after {max_retries} retries"
+                    )
+                    return None
+                wait = 60 if response.status_code == 429 else min(90, 15 * (retry_count + 1))
+                print(
+                    f"Steam {response.status_code} for app_id {app_id}. "
+                    f"Waiting {wait}s before retry {retry_count + 1}/{max_retries}..."
+                )
+                time.sleep(wait)
+                return self.get_store_page_html(app_id, retry_count + 1, max_retries)
+            if response.status_code != 200:
+                print(f"Failed to fetch store page for app_id {app_id}: {response.status_code}")
+                return None
+            # Age-gate / soft-block pages are often tiny
+            if len(response.text) < 1000:
+                if retry_count < max_retries:
+                    wait = 20 * (retry_count + 1)
+                    print(
+                        f"Short store page for app_id {app_id} "
+                        f"({len(response.text)} bytes). Waiting {wait}s then retry..."
+                    )
+                    time.sleep(wait)
+                    return self.get_store_page_html(app_id, retry_count + 1, max_retries)
+                print(f"Short store page for app_id {app_id} after retries — skipping")
+                return None
+            return response.text
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
                 requests.exceptions.TooManyRedirects) as e:
-            print(f"Network error getting tags for app_id {app_id}: {str(e)}")
-            return []
+            if retry_count < max_retries:
+                wait = 15 * (retry_count + 1)
+                print(
+                    f"Network error for app_id {app_id}: {e}. "
+                    f"Waiting {wait}s before retry {retry_count + 1}/{max_retries}..."
+                )
+                time.sleep(wait)
+                return self.get_store_page_html(app_id, retry_count + 1, max_retries)
+            print(f"Network error fetching store page for app_id {app_id}: {str(e)}")
+            return None
         except Exception as e:
-            print(f"Error getting tags for app_id {app_id}: {str(e)}")
-            return []
+            print(f"Error fetching store page for app_id {app_id}: {str(e)}")
+            return None
+
+    def get_store_page_extras(self, app_id):
+        """
+        One store-page fetch → user tags + disclosure notices
+        (AI / kernel anti-cheat / DRM / EULA).
+        """
+        html = self.get_store_page_html(app_id)
+        if not html:
+            return {"tags": [], "notices": empty_store_notices()}
+
+        tag_pattern = r'"tagid":\s*(\d+),\s*"name":\s*"([^"]+)"'
+        matches = re.findall(tag_pattern, html)
+        tags = [match[1] for match in matches] if matches else []
+        if tags:
+            print(f"🏷️  Found {len(tags)} tags for app_id {app_id}")
+        else:
+            print(f"📭 No tags found for app_id {app_id}")
+
+        notices = parse_store_notices(html)
+        print(
+            f"🧾 Notices for app_id {app_id}: "
+            f"ai={notices['made_with_ai']} kernel={notices['requires_kernel_anticheat']} "
+            f"drm={notices['has_third_party_drm']} denuvo={notices['has_denuvo']} "
+            f"eula={notices['requires_eula']}"
+        )
+        return {"tags": tags, "notices": notices}
+
+    def get_game_tags(self, app_id, retry_count=0):
+        """Get user tags for a specific game from Steam store page."""
+        extras = self.get_store_page_extras(app_id)
+        return extras.get("tags") or []
+
+    def get_store_notices(self, app_id):
+        """Get AI / kernel / DRM / EULA disclosure flags from the store page."""
+        extras = self.get_store_page_extras(app_id)
+        return extras.get("notices") or empty_store_notices()
 
 class SupabasePipeline:
     def __init__(self):
@@ -145,10 +229,33 @@ class SupabasePipeline:
             self.conn = psycopg2.connect(self.connection_string)
             self.cursor = self.conn.cursor()
             print("✅ Connected to Supabase database")
+            self.ensure_store_notice_columns()
             return True
         except Exception as e:
             print(f"❌ Error connecting to Supabase: {str(e)}")
             return False
+
+    def ensure_store_notice_columns(self):
+        """Add store-notice columns to games if missing (idempotent)."""
+        statements = [
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS made_with_ai BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS made_with_ai_disclosure TEXT",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS requires_kernel_anticheat BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS kernel_anticheat_name TEXT",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS has_third_party_drm BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS third_party_drm TEXT",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS has_denuvo BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS requires_eula BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS eula_label TEXT",
+            "ALTER TABLE games ADD COLUMN IF NOT EXISTS store_notices_updated_at TIMESTAMP",
+        ]
+        try:
+            for stmt in statements:
+                self.cursor.execute(stmt)
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print(f"⚠️  Could not ensure store-notice columns: {e}")
     
     def disconnect(self):
         """Disconnect from Supabase database."""
@@ -168,6 +275,16 @@ class SupabasePipeline:
             print(f"Error getting highest app_id: {str(e)}")
             return 0
     
+    def get_existing_app_ids(self):
+        """Get all app_ids currently in the database."""
+        try:
+            self.cursor.execute("SELECT app_id FROM games")
+            result = self.cursor.fetchall()
+            return set(row[0] for row in result)
+        except Exception as e:
+            print(f"Error getting existing app_ids: {str(e)}")
+            return set()
+    
     def safe_int_convert(self, value):
         """Safely convert value to integer, handling text like '17+'"""
         if value is None:
@@ -180,9 +297,11 @@ class SupabasePipeline:
         except (ValueError, TypeError):
             return None
     
-    def insert_game(self, app_id, name, details, review_summary):
+    def insert_game(self, app_id, name, details, review_summary, store_notices=None):
         """Insert a game into the Supabase games table."""
         try:
+            notices = store_notices or empty_store_notices()
+
             # Handle pc_requirements which can be a list or dict
             pc_reqs = details.get('pc_requirements', {})
             min_reqs = ''
@@ -201,9 +320,16 @@ class SupabasePipeline:
                 is_free = bool(is_free)
             
             required_age = self.safe_int_convert(details.get('required_age'))
-            
-            # Insert into games table
-            self.cursor.execute("""
+
+            metacritic = details.get('metacritic') or {}
+            metacritic_score = metacritic.get('score') if isinstance(metacritic, dict) else None
+            recommendations = details.get('recommendations') or {}
+            recommendations_total = (
+                recommendations.get('total') if isinstance(recommendations, dict) else None
+            )
+            now = datetime.now()
+
+            insert_sql = """
                 INSERT INTO games (
                     app_id, name, type, required_age, is_free, detailed_description,
                     short_description, supported_languages, header_image, website,
@@ -212,11 +338,16 @@ class SupabasePipeline:
                     release_date, support_info, background, content_descriptors,
                     minimum_requirements, recommended_requirements, num_reviews,
                     review_score, review_score_desc, total_positive, total_negative,
-                    total_reviews, last_updated
+                    total_reviews, last_updated,
+                    made_with_ai, made_with_ai_disclosure,
+                    requires_kernel_anticheat, kernel_anticheat_name,
+                    has_third_party_drm, third_party_drm, has_denuvo,
+                    requires_eula, eula_label, store_notices_updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 ) ON CONFLICT (app_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     type = EXCLUDED.type,
@@ -249,8 +380,19 @@ class SupabasePipeline:
                     total_positive = EXCLUDED.total_positive,
                     total_negative = EXCLUDED.total_negative,
                     total_reviews = EXCLUDED.total_reviews,
-                    last_updated = CURRENT_TIMESTAMP
-            """, (
+                    last_updated = CURRENT_TIMESTAMP,
+                    made_with_ai = EXCLUDED.made_with_ai,
+                    made_with_ai_disclosure = EXCLUDED.made_with_ai_disclosure,
+                    requires_kernel_anticheat = EXCLUDED.requires_kernel_anticheat,
+                    kernel_anticheat_name = EXCLUDED.kernel_anticheat_name,
+                    has_third_party_drm = EXCLUDED.has_third_party_drm,
+                    third_party_drm = EXCLUDED.third_party_drm,
+                    has_denuvo = EXCLUDED.has_denuvo,
+                    requires_eula = EXCLUDED.requires_eula,
+                    eula_label = EXCLUDED.eula_label,
+                    store_notices_updated_at = EXCLUDED.store_notices_updated_at
+            """
+            params = (
                 app_id,
                 name,
                 details.get('type'),
@@ -261,20 +403,20 @@ class SupabasePipeline:
                 details.get('supported_languages'),
                 details.get('header_image'),
                 details.get('website'),
-                json.dumps(details.get('developers', [])),
-                json.dumps(details.get('publishers', [])),
-                json.dumps(details.get('price_overview', {})),
-                json.dumps(details.get('platforms', {})),
-                details.get('metacritic', {}).get('score'),
-                json.dumps(details.get('categories', [])),
-                json.dumps(details.get('genres', [])),
-                json.dumps(details.get('screenshots', [])),
-                json.dumps(details.get('movies', [])),
-                details.get('recommendations', {}).get('total'),
-                json.dumps(details.get('release_date', {})),
-                json.dumps(details.get('support_info', {})),
+                json.dumps(details.get('developers') or []),
+                json.dumps(details.get('publishers') or []),
+                json.dumps(details.get('price_overview') or {}),
+                json.dumps(details.get('platforms') or {}),
+                metacritic_score,
+                json.dumps(details.get('categories') or []),
+                json.dumps(details.get('genres') or []),
+                json.dumps(details.get('screenshots') or []),
+                json.dumps(details.get('movies') or []),
+                recommendations_total,
+                json.dumps(details.get('release_date') or {}),
+                json.dumps(details.get('support_info') or {}),
                 details.get('background'),
-                json.dumps(details.get('content_descriptors', {})),
+                json.dumps(details.get('content_descriptors') or {}),
                 json.dumps(min_reqs),
                 json.dumps(rec_reqs),
                 review_summary.get('num_reviews'),
@@ -283,18 +425,35 @@ class SupabasePipeline:
                 review_summary.get('total_positive'),
                 review_summary.get('total_negative'),
                 review_summary.get('total_reviews'),
-                datetime.now()
-            ))
+                now,
+                bool(notices.get('made_with_ai')),
+                notices.get('made_with_ai_disclosure'),
+                bool(notices.get('requires_kernel_anticheat')),
+                notices.get('kernel_anticheat_name'),
+                bool(notices.get('has_third_party_drm')),
+                notices.get('third_party_drm'),
+                bool(notices.get('has_denuvo')),
+                bool(notices.get('requires_eula')),
+                notices.get('eula_label'),
+                now,
+            )
+            placeholder_count = insert_sql.count('%s')
+            if placeholder_count != len(params):
+                raise ValueError(
+                    f"Insert param mismatch: {placeholder_count} placeholders vs {len(params)} values"
+                )
+
+            self.cursor.execute(insert_sql, params)
             
             # Insert price history if available
-            if 'price_overview' in details:
-                price_data = details['price_overview']
+            price_data = details.get('price_overview')
+            if isinstance(price_data, dict) and price_data:
                 self.cursor.execute("""
                     INSERT INTO price_history (app_id, price, discount_percent, initial_price, final_price)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (
                     app_id,
-                    price_data.get('price'),
+                    price_data.get('final') or price_data.get('price'),
                     price_data.get('discount_percent'),
                     price_data.get('initial'),
                     price_data.get('final')
@@ -330,8 +489,16 @@ class SupabasePipeline:
             print(f"Error inserting tags for app_id {app_id}: {str(e)}")
             return False
 
-def update_steam_data_to_supabase(api_key, start_app_id=None, limit=None, fetch_tags=True):
-    """Update Steam games data directly to Supabase database."""
+def update_steam_data_to_supabase(api_key, start_app_id=None, limit=None, fetch_tags=True, check_all_missing=False):
+    """Update Steam games data directly to Supabase database.
+    
+    Args:
+        api_key: Steam API key
+        start_app_id: If provided, start checking from this app_id. If None, uses latest in DB + 10
+        limit: Number of games to check (default 100, in increments of 10)
+        fetch_tags: Whether to fetch and store game tags
+        check_all_missing: Not used - kept for compatibility
+    """
     steam_api = SteamAPI(api_key)
     pipeline = SupabasePipeline()
     
@@ -340,97 +507,120 @@ def update_steam_data_to_supabase(api_key, start_app_id=None, limit=None, fetch_
         return
     
     try:
-        # If no start_app_id provided, get the highest one from the database
+        # Get the latest app_id from database
         if start_app_id is None:
-            start_app_id = pipeline.get_highest_app_id() + 1
-            print(f"🔄 Resuming from app_id {start_app_id}")
+            latest_app_id = pipeline.get_highest_app_id()
+            if latest_app_id is None or latest_app_id == 0:
+                print("❌ No games found in database. Cannot determine starting point.")
+                return
+            # Start checking from the next increment of 10
+            start_app_id = ((latest_app_id // 10) + 1) * 10
+            print(f"📊 Latest app_id in database: {latest_app_id}")
+            print(f"🔄 Starting check from app_id: {start_app_id}")
         else:
-            print(f"🔄 Starting from app_id {start_app_id}")
+            print(f"🔄 Starting check from app_id: {start_app_id}")
         
-        # Get list of all Steam apps
-        print("📋 Fetching Steam app list...")
-        apps = steam_api.get_app_list()
-        if not apps:
-            print("❌ Failed to fetch app list")
+        # Default to checking next 1000 games (in increments of 10, so checks 1000 app_ids)
+        if limit is None:
+            limit = 1000
+        
+        # Generate list of app_ids to check (in increments of 10)
+        app_ids_to_check = []
+        for i in range(limit):
+            app_id = start_app_id + (i * 10)
+            app_ids_to_check.append(app_id)
+        
+        print(f"📋 Will check {len(app_ids_to_check)} app_ids (increments of 10)")
+        print(f"   Range: {app_ids_to_check[0]} to {app_ids_to_check[-1]}")
+        
+        # Check which app_ids already exist in database
+        existing_app_ids = pipeline.get_existing_app_ids()
+        app_ids_to_process = [app_id for app_id in app_ids_to_check if app_id not in existing_app_ids]
+        
+        print(f"📊 Found {len(app_ids_to_process)} new app_ids to process (out of {len(app_ids_to_check)} checked)")
+        
+        if len(app_ids_to_process) == 0:
+            print("✅ No new games to process in this range!")
             return
         
-        # Filter and sort apps
-        valid_apps = [app for app in apps if app['appid'] >= start_app_id]
-        valid_apps.sort(key=lambda x: x['appid'])
-        
-        if limit:
-            valid_apps = valid_apps[:limit]
+        # Convert to app list format for processing
+        valid_apps = [{'appid': app_id, 'name': f'App {app_id}'} for app_id in app_ids_to_process]
         
         total_apps = len(valid_apps)
-        print(f"📊 Found {total_apps} apps to process")
+        print(f"📊 Processing {total_apps} new games")
         
-        if total_apps == 0:
-            print("✅ No new apps to process")
-            return
-        
-        # Process apps
+        # Process apps - check each app_id to see if it exists on Steam
         processed = 0
         skipped = 0
         successful = 0
         tags_collected = 0
+        not_found = 0
         
         for app in valid_apps:
             app_id = app['appid']
-            name = app['name']
             
-            print(f"\n🔄 Processing {processed + 1}/{total_apps}: {name} (ID: {app_id})...")
+            print(f"\n🔄 Processing {processed + 1}/{total_apps}: Checking app_id {app_id}...")
             
             # Get detailed information
             details = steam_api.get_app_details(app_id)
             if not details:
-                print(f"❌ Failed to get details for {name}")
+                print(f"   ❌ App_id {app_id} not found on Steam")
+                not_found += 1
                 skipped += 1
                 processed += 1
                 continue
-                
+            
+            # Get the actual name from details
+            name = details.get('name', f'App {app_id}')
+            print(f"   ✅ Found: {name}")
+            
             # Skip non-game content
             app_type = details.get('type', '').lower()
             if app_type not in ['game']:
-                print(f"⏭️ Skipping {name} - Type: {app_type}")
+                print(f"   ⏭️ Skipping {name} - Type: {app_type}")
                 skipped += 1
                 processed += 1
                 continue
             
             # Get review summary
             review_summary = steam_api.get_review_summary(app_id)
-            print(f"📊 Review summary: {json.dumps(review_summary, indent=2)}")
+            print(f"   📊 Review summary: {json.dumps(review_summary, indent=2)}")
+
+            # Store page: tags + AI/kernel/DRM/EULA notices (single HTML fetch)
+            print(f"   🧾 Fetching store-page extras for {name}...")
+            extras = steam_api.get_store_page_extras(app_id)
+            notices = extras.get("notices") or empty_store_notices()
+            tags = extras.get("tags") or []
             
             # Insert into Supabase
-            if pipeline.insert_game(app_id, name, details, review_summary):
-                print(f"✅ Successfully processed {name}")
+            if pipeline.insert_game(app_id, name, details, review_summary, store_notices=notices):
+                print(f"   ✅ Successfully added {name} to database")
                 successful += 1
                 
-                # Fetch and insert tags if enabled
-                if fetch_tags:
-                    print(f"🏷️  Fetching tags for {name}...")
-                    tags = steam_api.get_game_tags(app_id)
-                    if tags:
-                        if pipeline.insert_game_tags(app_id, tags):
-                            tags_collected += len(tags)
-                            print(f"🏷️  Successfully collected {len(tags)} tags for {name}")
-                        else:
-                            print(f"❌ Failed to insert tags for {name}")
+                # Insert tags if enabled
+                if fetch_tags and tags:
+                    if pipeline.insert_game_tags(app_id, tags):
+                        tags_collected += len(tags)
+                        print(f"   🏷️  Successfully collected {len(tags)} tags for {name}")
                     else:
-                        print(f"📭 No tags found for {name}")
+                        print(f"   ❌ Failed to insert tags for {name}")
+                elif fetch_tags:
+                    print(f"   📭 No tags found for {name}")
             else:
-                print(f"❌ Failed to insert {name}")
+                print(f"   ❌ Failed to insert {name}")
                 skipped += 1
             
             processed += 1
             
             # Progress update every 10 games
             if processed % 10 == 0:
-                print(f"\n📈 Progress: {processed}/{total_apps} processed, {successful} successful, {skipped} skipped, {tags_collected} tags collected")
+                print(f"\n📈 Progress: {processed}/{total_apps} checked, {successful} added, {skipped} skipped, {not_found} not found, {tags_collected} tags collected")
         
         print(f"\n🎉 Pipeline completed!")
-        print(f"📊 Total processed: {processed}")
-        print(f"✅ Successful: {successful}")
+        print(f"📊 Total checked: {processed}")
+        print(f"✅ Games added: {successful}")
         print(f"⏭️ Skipped: {skipped}")
+        print(f"❌ Not found on Steam: {not_found}")
         print(f"🏷️ Tags collected: {tags_collected}")
         
     except Exception as e:
@@ -441,9 +631,10 @@ def update_steam_data_to_supabase(api_key, start_app_id=None, limit=None, fetch_
 if __name__ == "__main__":
     load_dotenv()
     STEAM_API_KEY = os.getenv('STEAM_API_KEY')
-    START_APP_ID = None
-    LIMIT = None
+    START_APP_ID = None  # If None, will use latest in DB + next increment of 10
+    LIMIT = 1000  # Number of games to check (in increments of 10, so checks 1000 app_ids)
     FETCH_TAGS = True
+    CHECK_ALL_MISSING = False  # Not used - kept for compatibility
     print("Starting Steam to Supabase Pipeline")
     print("=" * 50)
-    update_steam_data_to_supabase(STEAM_API_KEY, START_APP_ID, LIMIT, FETCH_TAGS) 
+    update_steam_data_to_supabase(STEAM_API_KEY, START_APP_ID, LIMIT, FETCH_TAGS, CHECK_ALL_MISSING) 

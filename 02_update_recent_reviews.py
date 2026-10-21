@@ -118,21 +118,27 @@ class SupabasePipeline:
             self.conn.close()
         print("✅ Disconnected from Supabase database")
     
-    def get_recent_games(self, days_back=30):
+    def get_recent_games(self, days_back=90, limit=None):
         """Get games released within the specified number of days."""
         try:
             # Calculate the date threshold
             threshold_date = datetime.now() - timedelta(days=days_back)
             
-            # Query for games with release_date_actual within the past month
-            self.cursor.execute("""
+            # Query for games with release_date_actual within the lookback window
+            query = """
                 SELECT app_id, name, release_date_actual
                 FROM games 
                 WHERE release_date_actual IS NOT NULL 
                 AND release_date_actual >= %s
                 AND type = 'game'
                 ORDER BY release_date_actual DESC
-            """, (threshold_date,))
+            """
+            params = [threshold_date]
+            if limit:
+                query += " LIMIT %s"
+                params.append(limit)
+            
+            self.cursor.execute(query, params)
             
             games = self.cursor.fetchall()
             print(f"📊 Found {len(games)} games released in the past {days_back} days")
@@ -204,8 +210,8 @@ class SupabasePipeline:
             self.conn.rollback()
             return False
 
-def update_recent_game_reviews(api_key, days_back=30, limit=None, fetch_tags=True):
-    """Update review data and tags for games released in the past month."""
+def update_recent_game_reviews(api_key, days_back=90, limit=None, fetch_tags=True):
+    """Update review data and tags for games released within the lookback window."""
     steam_api = SteamAPI(api_key)
     pipeline = SupabasePipeline()
     
@@ -216,16 +222,14 @@ def update_recent_game_reviews(api_key, days_back=30, limit=None, fetch_tags=Tru
     try:
         print(f"🔄 Looking for games released in the past {days_back} days...")
         
-        # Get recent games
-        recent_games = pipeline.get_recent_games(days_back)
+        # Get recent games (limit applied in the query when set)
+        recent_games = pipeline.get_recent_games(days_back, limit=limit)
         
         if not recent_games:
             print("✅ No recent games found to update")
             return
         
-        # Apply limit if specified
         if limit:
-            recent_games = recent_games[:limit]
             print(f"📊 Limiting to {limit} games for processing")
         
         total_games = len(recent_games)
@@ -293,8 +297,8 @@ def update_recent_game_reviews(api_key, days_back=30, limit=None, fetch_tags=Tru
 if __name__ == "__main__":
     load_dotenv()
     STEAM_API_KEY = os.getenv('STEAM_API_KEY')
-    DAYS_BACK = 30
-    LIMIT = None
+    DAYS_BACK = 90
+    LIMIT = None  # No cap — process all games in the lookback window
     FETCH_TAGS = True
     print("Starting Recent Game Reviews and Tags Update")
     print("=" * 50)

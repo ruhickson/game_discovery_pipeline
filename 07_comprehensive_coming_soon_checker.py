@@ -16,6 +16,8 @@ import re
 from datetime import datetime, date
 import os
 import sys
+import importlib.util
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -284,6 +286,19 @@ def is_early_access_game(categories):
     categories_str = json.dumps(categories).lower()
     return any(indicator.lower() in categories_str for indicator in early_access_indicators)
 
+def run_release_date_actual_update():
+    """Execute the release_date_actual recalculation script."""
+    module_path = Path(__file__).parent / "05_update_release_date_actual.py"
+    spec = importlib.util.spec_from_file_location("release_date_actual_runtime", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Unable to locate release date update script.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if hasattr(module, "main"):
+        module.main()
+    else:
+        raise AttributeError("Release date update script is missing a main() function.")
+
 def comprehensive_coming_soon_check():
     """Main function to check all coming soon games comprehensively."""
     steam_api = SteamAPI()
@@ -429,6 +444,14 @@ def comprehensive_coming_soon_check():
         
         if released_games_found > 0:
             print(f"\n🎮 Found {released_games_found} games that are no longer coming soon")
+        
+        # Update release_date_actual for all updated games
+        if updated > 0:
+            print(f"\n🗓️  Re-running release_date_actual update for all processed games...")
+            try:
+                run_release_date_actual_update()
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to update release_date_actual: {str(e)}")
         
     except Exception as e:
         print(f"❌ Error during comprehensive check: {str(e)}")
