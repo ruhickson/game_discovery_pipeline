@@ -20,6 +20,7 @@ PIPELINE_SCRIPTS = [
     # "03_collect_all_nintendo_games_clean.py",  # Temporarily bypassed
     "04_check_coming_soon_updates.py",
     "05_update_release_date_actual.py",
+    "20_sync_genres_table.py",
     "06_recreate_top_line_metrics.py",
     "16_build_state_of_steam_monthly.py",
 ]
